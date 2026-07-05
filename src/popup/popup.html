@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lectra Receiver</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="popup">
+    <header class="topbar">
+      <img class="logo" src="../../assets/icons/icon48.png" alt="">
+      <div>
+        <h1>Lectra Receiver</h1>
+        <p id="accountText">Checking account...</p>
+      </div>
+    </header>
+
+    <section id="authSection" class="section">
+      <button id="signInButton" class="primary-button" type="button">Sign in with Google</button>
+      <button id="signOutButton" class="secondary-button hidden" type="button">Sign out</button>
+      <p id="authError" class="error hidden"></p>
+    </section>
+
+    <section class="section switch-row">
+      <div>
+        <h2>Lectra tools</h2>
+        <p>Show Send to Lectra on PDFs and keep the receiver ready.</p>
+      </div>
+      <label class="switch" aria-label="Enable Lectra tools">
+        <input id="enableToggle" type="checkbox">
+        <span></span>
+      </label>
+    </section>
+
+    <section class="section status-card">
+      <div class="status-head">
+        <h2>Receiver</h2>
+        <span id="receiverDot" class="dot"></span>
+      </div>
+      <p id="receiverStatus">Loading status...</p>
+      <p id="receiverDetail" class="muted"></p>
+    </section>
+
+    <section class="section hints">
+      <p>Open any PDF and click the floating button to send it to Lectra.</p>
+      <p>On Gradescope upload forms, use Select from Lectra to attach a saved PDF.</p>
+    </section>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

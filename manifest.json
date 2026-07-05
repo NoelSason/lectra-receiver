@@ -1,0 +1,83 @@
+{
+  "manifest_version": 3,
+  "name": "Lectra Receiver",
+  "description": "Send PDFs to Lectra and receive annotated files back from your browser.",
+  "version": "1.0.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApQ75G+rrU1R0Ac5+5SaKFYOju+qwnoEhhljJO2XbX0r1elqYlnbpHJ+O2cQ4RcaROAt39aSrFSxE3WjP1astD08zIa1s4FS7TOSKHtKWjiOkjVU7VZO63Cf31BnlN11ELrzL3kVqoy0RVZ1m8ngdJuROv3iQxLg19Aa7PmLyCJndAQqw0DNloIh3IJnR9C1TEfUwJ781rQWkKlzTRq1KEov+cqpKk8LKVpVrtccAs065ZZvtEzjGx+5cUbF4OWXQa8bNoGd5oVnWpScnu8i0Pa89RgllJQC/XVj/8iep7AjpWFlfpi+BZfqvshmN3AW+cnb7S39luHoTFuscl5J5HQIDAQAB",
+  "icons": {
+    "16": "assets/icons/icon16.png",
+    "32": "assets/icons/icon32.png",
+    "48": "assets/icons/icon48.png",
+    "128": "assets/icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Lectra Receiver",
+    "default_popup": "src/popup/popup.html",
+    "default_icon": {
+      "16": "assets/icons/icon16.png",
+      "32": "assets/icons/icon32.png",
+      "48": "assets/icons/icon48.png",
+      "128": "assets/icons/icon128.png"
+    }
+  },
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "activeTab",
+    "tabs",
+    "alarms",
+    "offscreen",
+    "scripting",
+    "identity",
+    "downloads",
+    "notifications"
+  ],
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*",
+    "file:///*",
+    "https://*.supabase.co/*",
+    "*://*.gradescope.com/*"
+  ],
+  "oauth2": {
+    "client_id": "961806200943-6deqch1r87uthbarmr7te483u4h7fn9m.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/userinfo.email",
+      "https://www.googleapis.com/auth/userinfo.profile"
+    ]
+  },
+  "background": {
+    "service_worker": "src/background/background-wrapper.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.gradescope.com/*"],
+      "js": [
+        "src/lib/pdf.min.js",
+        "src/content/attach-from-lectra.js",
+        "src/content/gradescope.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "src/lib/pdf.worker.min.js",
+        "assets/icons/icon16.png",
+        "assets/icons/icon32.png",
+        "assets/icons/icon48.png",
+        "assets/icons/icon128.png"
+      ],
+      "matches": [
+        "https://*/*",
+        "http://*/*",
+        "file:///*",
+        "*://*.gradescope.com/*"
+      ]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'none'"
+  }
+}
