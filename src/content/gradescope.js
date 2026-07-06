@@ -14,10 +14,19 @@
 
   const BTN_FLAG = 'data-lectra-lectra-btn';
   const HOST_FLAG = 'data-lectra-lectra-host';
+  const ACTIVE_ATTR = 'data-lectra-receiver-active';
+  const ACTIVE_EVENT = 'lectra-receiver:active';
+  const CANVASCOPE_LECTRA_SELECTORS = [
+    '[data-canvascope-lectra-btn]',
+    '[data-canvascope-lectra-host]',
+    '[data-canvascope-lectra-root]',
+    '[data-canvascope-lectra-overlay]'
+  ].join(',');
   const DEFAULT_EXTENSION_SETTINGS = Object.freeze({
-    enableSendToLectra: false
+    enableSendToLectra: true
   });
   let extensionSettings = { ...DEFAULT_EXTENSION_SETTINGS };
+  let suppressionObserver = null;
 
   function api() {
     return window.LectraAttach || null;
@@ -25,15 +34,76 @@
 
   function normalizeExtensionSettings(rawSettings) {
     const source = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
+    const hasExplicitSendSetting = Object.prototype.hasOwnProperty.call(source, 'enableSendToLectra');
     return {
       ...DEFAULT_EXTENSION_SETTINGS,
       ...source,
-      enableSendToLectra: Boolean(source.enableSendToLectra)
+      enableSendToLectra: hasExplicitSendSetting
+        ? Boolean(source.enableSendToLectra)
+        : DEFAULT_EXTENSION_SETTINGS.enableSendToLectra
     };
   }
 
   function isLectraEnabled() {
     return Boolean(extensionSettings.enableSendToLectra);
+  }
+
+  function markLectraReceiverActive() {
+    try {
+      document.documentElement?.setAttribute(ACTIVE_ATTR, 'true');
+      window.dispatchEvent(new CustomEvent(ACTIVE_EVENT, {
+        detail: {
+          active: true,
+          extensionId: chrome.runtime?.id || null
+        }
+      }));
+    } catch (_) { /* ignore */ }
+  }
+
+  function clearLectraReceiverActive() {
+    try {
+      document.documentElement?.removeAttribute(ACTIVE_ATTR);
+      window.dispatchEvent(new CustomEvent(ACTIVE_EVENT, {
+        detail: {
+          active: false,
+          extensionId: chrome.runtime?.id || null
+        }
+      }));
+    } catch (_) { /* ignore */ }
+  }
+
+  function suppressCanvascopeLectraUi() {
+    try {
+      document.querySelectorAll(CANVASCOPE_LECTRA_SELECTORS).forEach((node) => {
+        if (node.hasAttribute?.('data-canvascope-lectra-host')) {
+          node.removeAttribute('data-canvascope-lectra-host');
+        } else {
+          node.remove();
+        }
+      });
+    } catch (_) { /* ignore */ }
+  }
+
+  function installCanvascopeSuppression() {
+    if (suppressionObserver) return;
+    markLectraReceiverActive();
+    suppressCanvascopeLectraUi();
+    suppressionObserver = new MutationObserver(suppressCanvascopeLectraUi);
+    const root = document.documentElement || document.body;
+    if (root) {
+      suppressionObserver.observe(root, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['data-canvascope-lectra-btn', 'data-canvascope-lectra-host', 'data-canvascope-lectra-root', 'data-canvascope-lectra-overlay']
+      });
+    }
+  }
+
+  function uninstallCanvascopeSuppression() {
+    suppressionObserver?.disconnect();
+    suppressionObserver = null;
+    clearLectraReceiverActive();
   }
 
   function removeButtons() {
@@ -154,8 +224,10 @@
   function injectButtons() {
     if (!isLectraEnabled()) {
       removeButtons();
+      uninstallCanvascopeSuppression();
       return;
     }
+    installCanvascopeSuppression();
 
     const controls = findSelectFileControls();
     for (const control of controls) {

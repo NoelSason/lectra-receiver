@@ -17,16 +17,19 @@ This repo contains only the Lectra browser send, receive, and attach workflows.
 
 ## Backend Redirect
 
-This unpacked extension uses a fixed manifest key, so its extension ID is:
+Chrome Web Store builds must not include a manifest `key`; Chrome assigns the
+published extension ID. After the first Web Store upload creates the item, add
+that ID's OAuth redirect URL to Supabase Auth Redirect URLs:
 
 ```text
-ahdmecpcieeomjfbbcabadejdegkhcme
+https://<published-extension-id>.chromiumapp.org/
 ```
 
-Add this redirect URL to Supabase Auth Redirect URLs before Google sign-in:
+For local unpacked development, Chrome may assign a different extension ID. Add
+that local ID too if you need local Google sign-in:
 
 ```text
-https://ahdmecpcieeomjfbbcabadejdegkhcme.chromiumapp.org/
+https://<local-extension-id>.chromiumapp.org/
 ```
 
 A wildcard such as `https://*.chromiumapp.org/*` also covers it.

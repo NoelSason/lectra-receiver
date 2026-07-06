@@ -190,12 +190,13 @@ const DROPBRIDGE_V2_DIAGNOSTICS_STORAGE_KEY = 'dropBridgeV2Diagnostics';
 const DROPBRIDGE_V2_DIAGNOSTIC_EVENT_LIMIT = 25;
 const DROPBRIDGE_V2_DEBUG = false; // enable only for local debugging
 const DEFAULT_EXTENSION_SETTINGS = Object.freeze({
-    enableSendToLectra: false
+    enableSendToLectra: true
 });
 const PDF_VIEWER_OVERLAY_CONTENT_SCRIPT_ID = 'lectraPdfViewerOverlay';
 const PDF_VIEWER_OVERLAY_WEBSITE_ORIGINS = ['https://*/*', 'http://*/*'];
 const PDF_VIEWER_OVERLAY_FILE_MATCH = 'file:///*';
 const PDF_VIEWER_DEBUG = false; // enable only for local debugging
+const PDF_CONTEXT_CACHE_TTL_MS = 20 * 1000;
 // The Gradescope picker owns Gradescope pages, so the "any PDF" send overlay
 // excludes them (avoids two Lectra buttons on the same page).
 const STATIC_LMS_CONTENT_SCRIPT_MATCHES = ['*://*.gradescope.com/*'];
@@ -218,13 +219,17 @@ let dropBridgeV2CachedDeviceId = null;
 const dropBridgeV2ActiveUploads = new Set();
 const dropBridgeV2TargetedClaimsInFlight = new Set();
 const pdfSendInFlightKeys = new Set();
+const pdfContextCache = new Map();
 
 function normalizeExtensionSettings(rawSettings) {
     const source = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
+    const hasExplicitSendSetting = Object.prototype.hasOwnProperty.call(source, 'enableSendToLectra');
     return {
         ...DEFAULT_EXTENSION_SETTINGS,
         ...source,
-        enableSendToLectra: Boolean(source.enableSendToLectra)
+        enableSendToLectra: hasExplicitSendSetting
+            ? Boolean(source.enableSendToLectra)
+            : DEFAULT_EXTENSION_SETTINGS.enableSendToLectra
     };
 }
 
@@ -1965,6 +1970,15 @@ function deriveDownloadUrlVariants(rawUrl) {
     }
 }
 
+function isCanvasDownloadRoute(rawUrl) {
+    try {
+        const parsed = new URL(rawUrl);
+        return /\/(?:courses\/\d+\/)?files\/\d+(?:\/download)?/i.test(parsed.pathname);
+    } catch {
+        return false;
+    }
+}
+
 function hasPdfSignature(bytes) {
     if (!bytes || bytes.length < 5) return false;
     const max = Math.min(bytes.length, PDF_HEADER_CHECK_BYTES);
@@ -2096,6 +2110,71 @@ function prioritizePdfCandidates(candidates, pageUrl = null) {
 
         return score(b) - score(a);
     });
+}
+
+function getPdfContextCacheKey(tab) {
+    if (!tab) return null;
+    return `${tab.id || 'tab'}:${tab.url || ''}:${tab.title || ''}`;
+}
+
+function readPdfContextCache(tab) {
+    const key = getPdfContextCacheKey(tab);
+    if (!key) return null;
+    const cached = pdfContextCache.get(key);
+    if (!cached || Date.now() - cached.storedAtMs > PDF_CONTEXT_CACHE_TTL_MS) {
+        pdfContextCache.delete(key);
+        return null;
+    }
+    return cached.payload;
+}
+
+function writePdfContextCache(tab, payload) {
+    const key = getPdfContextCacheKey(tab);
+    if (!key || !payload) return payload;
+    pdfContextCache.set(key, {
+        storedAtMs: Date.now(),
+        payload
+    });
+    if (pdfContextCache.size > 30) {
+        const oldestKey = pdfContextCache.keys().next().value;
+        if (oldestKey) pdfContextCache.delete(oldestKey);
+    }
+    return payload;
+}
+
+function pickStrongLocalPdfCandidate({ tab, tabCandidates, viewerSrcUrl, normalizedTabUrl }) {
+    const candidates = [];
+    const add = (url, sourcePageUrl, reason, hintConfidence = 'weak') => {
+        const normalized = normalizePdfCandidateUrl(url, tab?.url || sourcePageUrl || undefined);
+        if (!normalized) return;
+        const confidence = String(hintConfidence || 'weak').toLowerCase();
+        const strong = confidence === 'strong'
+            || confidence === 'definitive'
+            || isLikelyPdfHint(normalized)
+            || reason === 'viewer_src';
+        if (!strong) return;
+        candidates.push({
+            url: normalized,
+            sourcePageUrl: normalizePdfCandidateUrl(sourcePageUrl || normalized, tab?.url || normalized) || normalized,
+            reason,
+            confidence: confidence === 'definitive' ? 'definitive' : 'strong'
+        });
+    };
+
+    if (viewerSrcUrl) add(viewerSrcUrl, viewerSrcUrl, 'viewer_src', 'strong');
+    if (normalizedTabUrl && isLikelyPdfHint(normalizedTabUrl)) add(normalizedTabUrl, normalizedTabUrl, 'tab_pdf_url', 'strong');
+    if (tabCandidates?.success) {
+        for (const candidate of tabCandidates.candidates || []) {
+            add(
+                candidate?.url,
+                tabCandidates.pageUrl || candidate?.url || normalizedTabUrl || tab?.url,
+                candidate?.source || 'content_script',
+                candidate?.hintConfidence || 'weak'
+            );
+        }
+    }
+
+    return candidates[0] || null;
 }
 
 function withTimeout(promise, timeoutMs, fallbackValue) {
@@ -2343,6 +2422,11 @@ async function resolvePdfViewerOverlayContextForTab(tab) {
         };
     }
 
+    const cached = readPdfContextCache(tab);
+    if (cached?.overlayContext) {
+        return cached.overlayContext;
+    }
+
     const viewerSrcUrl = parsePdfViewerSrcFromTabUrl(tab.url);
     const normalizedTabUrl = normalizePdfCandidateUrl(tab.url, tab.url);
     const attempts = [];
@@ -2378,40 +2462,65 @@ async function resolvePdfViewerOverlayContextForTab(tab) {
         }
     }
 
+    const strongLocalCandidate = pickStrongLocalPdfCandidate({
+        tab,
+        tabCandidates,
+        viewerSrcUrl,
+        normalizedTabUrl
+    });
+    if (strongLocalCandidate) {
+        return writePdfContextCache(tab, {
+            overlayContext: {
+                success: true,
+                showButton: true,
+                candidateUrl: strongLocalCandidate.url,
+                sourcePageUrl: strongLocalCandidate.sourcePageUrl,
+                titleHint: tabCandidates.titleHint || derivePdfViewerOverlayTitleHint(tab.title || '', strongLocalCandidate.url) || null,
+                reason: strongLocalCandidate.reason
+            }
+        }).overlayContext;
+    }
+
     if (attempts.length === 0) {
-        return {
+        return writePdfContextCache(tab, {
+            overlayContext: {
             success: true,
             showButton: false,
             candidateUrl: null,
             sourcePageUrl: null,
             titleHint: null,
             reason: 'unsupported_tab_scheme'
-        };
+            }
+        }).overlayContext;
     }
 
     for (const attempt of attempts) {
         const probe = await probePdfCandidate(attempt.url);
         if (probe.ok && PDF_CONFIDENCE_RANK[probe.confidence] >= PDF_CONFIDENCE_RANK.strong) {
-            return {
+            return writePdfContextCache(tab, {
+                overlayContext: {
                 success: true,
                 showButton: true,
                 candidateUrl: attempt.url,
                 sourcePageUrl: attempt.sourcePageUrl,
                 titleHint: tabCandidates.titleHint || derivePdfViewerOverlayTitleHint(tab.title || '', attempt.url) || null,
                 reason: probe.reason || attempt.reason
-            };
+                }
+            }).overlayContext;
         }
     }
 
     const fallback = attempts[0];
-    return {
+    return writePdfContextCache(tab, {
+        overlayContext: {
         success: true,
         showButton: false,
         candidateUrl: fallback?.url || null,
         sourcePageUrl: fallback?.sourcePageUrl || null,
         titleHint: fallback ? (tabCandidates.titleHint || derivePdfViewerOverlayTitleHint(tab.title || '', fallback.url) || null) : null,
         reason: 'top_level_not_pdf'
-    };
+        }
+    }).overlayContext;
 }
 
 async function buildPdfContextForTab(tab) {
@@ -2424,6 +2533,11 @@ async function buildPdfContextForTab(tab) {
             titleHint: null,
             reason: 'no_tab_url'
         };
+    }
+
+    const cached = readPdfContextCache(tab);
+    if (cached?.sendContext) {
+        return cached.sendContext;
     }
 
     const viewerSrcUrl = parsePdfViewerSrcFromTabUrl(tab.url);
@@ -2458,21 +2572,50 @@ async function buildPdfContextForTab(tab) {
         addCandidate(normalizedTabUrl, 'active_tab_url', hasDirectPdfHint ? 'strong' : 'weak');
     }
 
+    const sourcePageUrl = normalizePdfCandidateUrl(
+        tabCandidates.pageUrl || normalizedTabUrl || viewerSrcUrl,
+        tab.url
+    );
+
+    const strongLocalCandidate = pickStrongLocalPdfCandidate({
+        tab,
+        tabCandidates,
+        viewerSrcUrl,
+        normalizedTabUrl
+    });
+    if (strongLocalCandidate) {
+        return writePdfContextCache(tab, {
+            sendContext: {
+                hasPdf: true,
+                confidence: strongLocalCandidate.confidence,
+                candidateUrl: strongLocalCandidate.url,
+                sourcePageUrl: strongLocalCandidate.sourcePageUrl || sourcePageUrl,
+                titleHint: tabCandidates.titleHint || tab.title || null,
+                reason: strongLocalCandidate.reason
+            },
+            overlayContext: {
+                success: true,
+                showButton: true,
+                candidateUrl: strongLocalCandidate.url,
+                sourcePageUrl: strongLocalCandidate.sourcePageUrl || sourcePageUrl,
+                titleHint: tabCandidates.titleHint || derivePdfViewerOverlayTitleHint(tab.title || '', strongLocalCandidate.url) || null,
+                reason: strongLocalCandidate.reason
+            }
+        }).sendContext;
+    }
+
     if (candidates.length === 0) {
-        return {
+        return writePdfContextCache(tab, {
+            sendContext: {
             hasPdf: false,
             confidence: 'none',
             candidateUrl: null,
             sourcePageUrl: normalizePdfCandidateUrl(tab.url, tab.url),
             titleHint: tab.title || null,
             reason: 'no_candidate_urls'
-        };
+            }
+        }).sendContext;
     }
-
-    const sourcePageUrl = normalizePdfCandidateUrl(
-        tabCandidates.pageUrl || normalizedTabUrl || viewerSrcUrl,
-        tab.url
-    );
 
     const prioritized = prioritizePdfCandidates(candidates, sourcePageUrl || tab.url);
     let best = {
@@ -2527,14 +2670,16 @@ async function buildPdfContextForTab(tab) {
         };
     }
 
-    return {
+    return writePdfContextCache(tab, {
+        sendContext: {
         hasPdf: PDF_CONFIDENCE_RANK[best.confidence] >= PDF_CONFIDENCE_RANK.strong,
         confidence: best.confidence,
         candidateUrl: best.candidateUrl,
         sourcePageUrl,
         titleHint: tabCandidates.titleHint || tab.title || null,
         reason: best.reason
-    };
+        }
+    }).sendContext;
 }
 
 async function downloadAndVerifyPdf(candidateUrl) {
@@ -2739,7 +2884,9 @@ async function sendPdfToLectraFromMessage({ trigger, candidateUrl, sourcePageUrl
     }
 
     const activeMode = sender?.tab ? 'sender_tab' : 'active_tab';
-    const context = await resolvePdfContextFromMessage({ mode: activeMode, sender });
+    const contextPromise = resolvePdfContextFromMessage({ mode: activeMode, sender });
+    const sessionPromise = supabaseClient.auth.getSession();
+    const context = await contextPromise;
     const resolvedRequest = resolvePdfSendRequestPayload({
         liveContext: context,
         fallbackCandidateUrl: candidateUrl,
@@ -2768,7 +2915,7 @@ async function sendPdfToLectraFromMessage({ trigger, candidateUrl, sourcePageUrl
     pdfSendInFlightKeys.add(inFlightKey);
 
     try {
-        const { data: { session }, error: sessionError } = await supabaseClient.auth.getSession();
+        const { data: { session }, error: sessionError } = await sessionPromise;
         if (sessionError) {
             return {
                 success: false,
@@ -2795,8 +2942,10 @@ async function sendPdfToLectraFromMessage({ trigger, candidateUrl, sourcePageUrl
         };
 
         queueAttempt(resolvedCandidateUrl);
-        for (const variant of deriveDownloadUrlVariants(resolvedCandidateUrl || '')) {
-            queueAttempt(variant);
+        if (isCanvasDownloadRoute(resolvedCandidateUrl || '') || isCanvasDownloadRoute(resolvedSourceUrl || '')) {
+            for (const variant of deriveDownloadUrlVariants(resolvedCandidateUrl || '')) {
+                queueAttempt(variant);
+            }
         }
 
         let downloaded = null;
@@ -2821,10 +2970,12 @@ async function sendPdfToLectraFromMessage({ trigger, candidateUrl, sourcePageUrl
 
         const rowId = generateUuidV4();
         const storagePath = buildPdfStoragePath(session.user.id, rowId);
-        const uploadData = downloaded.bytes.buffer.slice(
-            downloaded.bytes.byteOffset,
-            downloaded.bytes.byteOffset + downloaded.bytes.byteLength
-        );
+        const uploadData = downloaded.bytes.byteOffset === 0 && downloaded.bytes.byteLength === downloaded.bytes.buffer.byteLength
+            ? downloaded.bytes.buffer
+            : downloaded.bytes.buffer.slice(
+                downloaded.bytes.byteOffset,
+                downloaded.bytes.byteOffset + downloaded.bytes.byteLength
+            );
 
         const { error: uploadError } = await supabaseClient.storage
             .from(LECTRA_DOCUMENTS_BUCKET)
@@ -3283,6 +3434,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     getExtensionSettings(),
                     buildDropBridgeV2PopupStatus()
                 ]);
+                if (settings.enableSendToLectra && authStatus?.signedIn) {
+                    void ensureDropBridgeV2LoopWarm('popup-open', { force: true }).catch((error) => {
+                        console.warn('[DropBridge v2] Popup-open warmup failed:', parseErrorMessage(error));
+                    });
+                }
                 sendResponse({
                     success: true,
                     signedIn: Boolean(authStatus?.signedIn),

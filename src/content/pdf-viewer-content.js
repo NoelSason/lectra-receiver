@@ -1,7 +1,16 @@
 (() => {
     const initKey = '__lectraPdfViewerOverlayInitialized';
-    const DEBUG = true;
+    const DEBUG = false;
     const VIEWER_CHANGE_DEBOUNCE_MS = 40;
+    const ACTIVE_ATTR = 'data-lectra-receiver-active';
+    const ACTIVE_EVENT = 'lectra-receiver:active';
+    const CANVASCOPE_LECTRA_SELECTORS = [
+        '#canvascope-send-to-lectra-btn',
+        '[data-canvascope-lectra-btn]',
+        '[data-canvascope-lectra-host]',
+        '[data-canvascope-lectra-root]',
+        '[data-canvascope-lectra-overlay]'
+    ].join(',');
 
     function debug(message, details = undefined) {
         if (!DEBUG) return;
@@ -24,7 +33,7 @@
     });
 
     const DEFAULT_EXTENSION_SETTINGS = Object.freeze({
-        enableSendToLectra: false
+        enableSendToLectra: true
     });
     const BUTTON_POSITION_STORAGE_KEY = 'lectraSendButtonPositions';
     const BUTTON_POSITION_SLOT = 'pdfViewer';
@@ -47,18 +56,90 @@
     let latestOverlayRequestId = 0;
     let latestViewerKey = '';
     let navigationHooksInstalled = false;
+    let suppressionObserver = null;
 
     function normalizeExtensionSettings(rawSettings) {
         const source = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
+        const hasExplicitSendSetting = Object.prototype.hasOwnProperty.call(source, 'enableSendToLectra');
         return {
             ...DEFAULT_EXTENSION_SETTINGS,
             ...source,
-            enableSendToLectra: Boolean(source.enableSendToLectra)
+            enableSendToLectra: hasExplicitSendSetting
+                ? Boolean(source.enableSendToLectra)
+                : DEFAULT_EXTENSION_SETTINGS.enableSendToLectra
         };
     }
 
     function isSendToLectraEnabled() {
         return Boolean(viewerExtensionSettings.enableSendToLectra);
+    }
+
+    function markLectraReceiverActive() {
+        try {
+            document.documentElement?.setAttribute(ACTIVE_ATTR, 'true');
+            window.dispatchEvent(new CustomEvent(ACTIVE_EVENT, {
+                detail: {
+                    active: true,
+                    extensionId: chrome.runtime?.id || null
+                }
+            }));
+        } catch {
+            // Ignore page teardown races.
+        }
+    }
+
+    function clearLectraReceiverActive() {
+        try {
+            document.documentElement?.removeAttribute(ACTIVE_ATTR);
+            window.dispatchEvent(new CustomEvent(ACTIVE_EVENT, {
+                detail: {
+                    active: false,
+                    extensionId: chrome.runtime?.id || null
+                }
+            }));
+        } catch {
+            // Ignore page teardown races.
+        }
+    }
+
+    function suppressCanvascopeLectraUi() {
+        try {
+            document.querySelectorAll(CANVASCOPE_LECTRA_SELECTORS).forEach((node) => {
+                if (node.id === 'canvascope-send-to-lectra-btn') {
+                    node.remove();
+                    return;
+                }
+                if (node.hasAttribute?.('data-canvascope-lectra-host')) {
+                    node.removeAttribute('data-canvascope-lectra-host');
+                    return;
+                }
+                node.remove();
+            });
+        } catch {
+            // Keep ownership best-effort so host page mutations never break Lectra.
+        }
+    }
+
+    function installCanvascopeSuppression() {
+        if (suppressionObserver) return;
+        markLectraReceiverActive();
+        suppressCanvascopeLectraUi();
+        suppressionObserver = new MutationObserver(suppressCanvascopeLectraUi);
+        const root = document.documentElement || document.body;
+        if (root) {
+            suppressionObserver.observe(root, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['id', 'data-canvascope-lectra-btn', 'data-canvascope-lectra-host', 'data-canvascope-lectra-root', 'data-canvascope-lectra-overlay']
+            });
+        }
+    }
+
+    function uninstallCanvascopeSuppression() {
+        suppressionObserver?.disconnect();
+        suppressionObserver = null;
+        clearLectraReceiverActive();
     }
 
     function decodePossiblyEncodedUrl(value) {
@@ -547,10 +628,31 @@
         };
     }
 
+    function resolveStrongLocalPdfContext() {
+        const candidatePayload = collectPdfCandidates();
+        const strongCandidate = candidatePayload.candidates.find((candidate) => {
+            const confidence = String(candidate?.hintConfidence || '').toLowerCase();
+            if (confidence === 'strong' || confidence === 'definitive') return true;
+            return /\.pdf(?:$|[?#])/i.test(candidate?.url || '');
+        });
+        if (!strongCandidate) return null;
+        return {
+            success: true,
+            showButton: true,
+            candidateUrl: strongCandidate.url,
+            sourcePageUrl: candidatePayload.pageUrl || window.location.href,
+            titleHint: candidatePayload.titleHint || document.title || '',
+            reason: `local_${strongCandidate.source || 'pdf_hint'}`
+        };
+    }
+
     function clearOverlayState(reason) {
         overlayContext = null;
         latestOverlayRequestId += 1;
         removeSendButton();
+        if (!isSendToLectraEnabled()) {
+            uninstallCanvascopeSuppression();
+        }
         debug('Cleared overlay state', { reason });
     }
 
@@ -600,8 +702,17 @@
         if (!isSendToLectraEnabled()) {
             overlayContext = null;
             removeSendButton();
+            uninstallCanvascopeSuppression();
             debug('Overlay disabled by settings');
             return;
+        }
+
+        installCanvascopeSuppression();
+        const localContext = resolveStrongLocalPdfContext();
+        if (localContext?.candidateUrl) {
+            overlayContext = localContext;
+            setSendButtonState('Send to Lectra', 'idle');
+            debug('Showing button from local strong PDF context', localContext);
         }
 
         chrome.runtime.sendMessage({ action: 'resolvePdfViewerOverlayContext' }, (response) => {
@@ -615,15 +726,21 @@
 
             if (chrome.runtime.lastError) {
                 debug('resolvePdfViewerOverlayContext runtime error', chrome.runtime.lastError.message || 'unknown');
-                overlayContext = null;
-                removeSendButton();
+                if (!localContext?.candidateUrl) {
+                    overlayContext = null;
+                    removeSendButton();
+                }
                 return;
             }
 
             overlayContext = response || null;
             debug('resolvePdfViewerOverlayContext response', overlayContext);
             if (!response?.showButton || !response?.candidateUrl) {
-                removeSendButton();
+                if (!localContext?.candidateUrl) {
+                    removeSendButton();
+                } else {
+                    overlayContext = localContext;
+                }
                 debug('Not showing button because resolver did not approve this tab');
                 return;
             }
@@ -656,9 +773,6 @@
             handleViewerContextChange('send_without_context', { force: true });
             return;
         }
-
-        const confirmed = window.confirm('Send this PDF to Lectra?');
-        if (!confirmed) return;
 
         setSendButtonState('Sending…', 'sending');
         chrome.runtime.sendMessage({
